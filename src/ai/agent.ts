@@ -257,6 +257,21 @@ export function setBridgeFunctions(fns: BridgeFunctions) {
 const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_MODEL_ID = "openrouter/free";
 
+/**
+ * Hard ceiling on a single tick's LLM request.
+ *
+ * The endpoint is serverless: after it scales to zero, the first request
+ * cold-starts a worker (~90s) before responding, so this must sit
+ * comfortably above that. Its real job is to stop a black-holed request
+ * from permanently silencing an agent — each agent's rate limiter allows
+ * only one in-flight call (maxConcurrent: 1), so a request that never
+ * resolves would freeze that agent for the rest of the session. On
+ * timeout the call throws (aborting the fetch); the catch block in
+ * tickAgent then reschedules after a short backoff, and the retry lands
+ * on the now-warm worker.
+ */
+const REQUEST_TIMEOUT_MS = 150_000;
+
 const modelCache = new Map<
   string,
   ReturnType<ReturnType<typeof createOpenAI>>
@@ -596,6 +611,10 @@ async function tickAgent(agentId: string): Promise<void> {
         system: runtime.systemPrompt + "\n\n" + dynamicContext,
         messages: runtime.messages,
         tools,
+        // Bound the request so a cold-start hang can't wedge the agent
+        // forever (see REQUEST_TIMEOUT_MS). Covers the whole multi-step
+        // tool loop, not just the first step.
+        abortSignal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         maxSteps: 5,
         // Larger than strictly needed for OpenAI/OpenRouter models, but
         // thinking/reasoning models (e.g. Qwen3.6 which emits an internal
